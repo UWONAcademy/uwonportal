@@ -190,7 +190,7 @@
   }
   .card-body{padding:24px 22px 22px;}
 
-  .control-row{display:flex;align-items:center;gap:14px;margin-bottom:18px;}
+  .control-row{display:flex;align-items:center;flex-wrap:wrap;gap:10px 12px;margin-bottom:18px;}
   .play-circle{
     width:52px;height:52px;border-radius:50%;flex-shrink:0;
     background:linear-gradient(135deg,var(--teal) 0%,var(--teal-deep) 100%);
@@ -200,6 +200,19 @@
   }
   .play-circle svg{width:22px;height:22px;}
   .play-circle:active{transform:scale(0.95);}
+
+  /* second, pausable player — visually secondary to the solid green button */
+  .play-pill{
+    display:inline-flex;align-items:center;gap:7px;flex-shrink:0;
+    height:44px;padding:0 16px 0 13px;border-radius:999px;
+    background:#fff;border:1.5px solid var(--teal);color:var(--teal-deep);
+    font-family:'Inter','PingFang SC',sans-serif;font-weight:600;font-size:13.5px;
+    cursor:pointer;line-height:1;
+  }
+  .play-pill svg{width:17px;height:17px;flex-shrink:0;}
+  .play-pill:active{transform:scale(0.97);}
+  .play-pill.is-playing{background:var(--teal-pale);}
+  .play-pill.is-paused{background:var(--amber-bg);border-color:var(--amber-pill);color:var(--amber-ink);}
 
   .speed-toggle{
     display:inline-flex;background:#F0F3F2;border-radius:999px;padding:3px;
@@ -291,6 +304,11 @@
     font-size:11px;font-weight:700;color:#fff;
   }
   .r-score{font-size:12px;color:var(--ink-soft);}
+  .r-badge{
+    background:var(--amber-bg);color:var(--amber-ink);
+    font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px;
+    white-space:nowrap;
+  }
   .r-replay{
     margin-left:auto;background:none;border:none;cursor:pointer;
     color:var(--teal-deep);display:flex;align-items:center;padding:2px;
@@ -360,8 +378,12 @@
       <div class="card-top"></div>
       <div class="card-body">
         <div class="control-row">
-          <button class="play-circle" id="play-btn" title="播放">
+          <button class="play-circle" id="play-btn" title="完整播放（不可暂停）">
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+          </button>
+          <button class="play-pill" id="playpause-btn" title="可暂停播放：暂停次数会记录在报告里">
+            <svg id="pp-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+            <span id="pp-label">可暂停</span>
           </button>
           <div class="speed-toggle">
             <button class="speed-opt active" id="speed-1x" data-rate="0.98">1x</button>
@@ -408,7 +430,7 @@
 
     <div class="report-section">
       <h3>本次打卡报告</h3>
-      <p class="report-hint">列出这次听写有误的句子，点 🔊 可以再听一次。</p>
+      <p class="report-hint">列出这次听写有误、或使用过「可暂停」播放的句子，点 🔊 可以再听一次。</p>
       <div id="report-list"></div>
     </div>
   </section>
@@ -444,6 +466,9 @@
 
   const wordBox = document.getElementById('word-box');
   const playBtn = document.getElementById('play-btn');
+  const playPauseBtn = document.getElementById('playpause-btn');
+  const ppIcon = document.getElementById('pp-icon');
+  const ppLabel = document.getElementById('pp-label');
   const speed1x = document.getElementById('speed-1x');
   const speedSlow = document.getElementById('speed-slow');
   const checkBtn = document.getElementById('check-btn');
@@ -524,13 +549,48 @@
   }
 
   let speakToken = 0;
-  function speak(text, rate){
+  // 'idle' | 'playing' | 'paused' — only tracks the pausable player
+  let ppState = 'idle';
+  // if the student pauses during the silent gap between breath-groups, we park
+  // the "play next group" callback here and fire it when they hit resume.
+  let pendingResume = null;
+
+  const ICON_PLAY  = '<path d="M8 5v14l11-7z"/>';
+  const ICON_PAUSE = '<path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z"/>';
+
+  function setPPState(state){
+    ppState = state;
+    playPauseBtn.classList.toggle('is-playing', state === 'playing');
+    playPauseBtn.classList.toggle('is-paused', state === 'paused');
+    if(state === 'playing'){
+      ppIcon.innerHTML = ICON_PAUSE;
+      ppLabel.textContent = '暂停';
+    } else if(state === 'paused'){
+      ppIcon.innerHTML = ICON_PLAY;
+      ppLabel.textContent = '继续';
+    } else {
+      ppIcon.innerHTML = ICON_PLAY;
+      ppLabel.textContent = '可暂停';
+    }
+  }
+  function resetPlayback(){
+    // resume first: cancelling while paused can leave Chrome's synth stuck
+    try{ speechSynthesis.resume(); }catch(e){}
     speechSynthesis.cancel();
+    speakToken++;
+    pendingResume = null;
+    setPPState('idle');
+  }
+
+  function speak(text, rate, opts){
+    try{ speechSynthesis.resume(); }catch(e){}
+    speechSynthesis.cancel();
+    pendingResume = null;
     const myToken = ++speakToken;
     const groups = splitIntoBreathGroups(text);
-    playGroups(groups, rate, 0, myToken);
+    playGroups(groups, rate, 0, myToken, opts || {});
   }
-  function playGroups(groups, rate, idx, myToken){
+  function playGroups(groups, rate, idx, myToken, opts){
     if(myToken !== speakToken || idx >= groups.length) return;
     const u = new SpeechSynthesisUtterance(groups[idx]);
     u.lang = 'en-US';
@@ -539,8 +599,16 @@
     u.pitch = 1;
     u.onend = ()=>{
       if(myToken !== speakToken) return;
-      const pause = idx < groups.length - 1 ? 260 : 0;
-      setTimeout(()=>playGroups(groups, rate, idx+1, myToken), pause);
+      if(idx >= groups.length - 1){
+        if(opts.pausable) setPPState('idle');
+        return;
+      }
+      const step = ()=>{
+        if(myToken !== speakToken) return;
+        if(opts.pausable && ppState === 'paused'){ pendingResume = step; return; }
+        playGroups(groups, rate, idx+1, myToken, opts);
+      };
+      setTimeout(step, 260);
     };
     speechSynthesis.speak(u);
   }
@@ -556,7 +624,29 @@
     speedSlow.classList.add('active');
     speed1x.classList.remove('active');
   });
-  playBtn.addEventListener('click', ()=>speak(sentences[currentIndex].text, currentRate));
+  playBtn.addEventListener('click', ()=>{
+    pendingResume = null;
+    setPPState('idle');
+    speak(sentences[currentIndex].text, currentRate, {pausable:false});
+  });
+
+  playPauseBtn.addEventListener('click', ()=>{
+    const s = sentences[currentIndex];
+    if(!s) return;
+    if(ppState === 'playing'){
+      // actually pausing is what gets recorded in the report
+      speechSynthesis.pause();
+      s.pauseCount = (s.pauseCount || 0) + 1;
+      setPPState('paused');
+    } else if(ppState === 'paused'){
+      setPPState('playing');
+      speechSynthesis.resume();
+      if(pendingResume){ const f = pendingResume; pendingResume = null; f(); }
+    } else {
+      setPPState('playing');
+      speak(s.text, currentRate, {pausable:true});
+    }
+  });
 
   // ---------- paste screen ----------
   function countWords(text){
@@ -601,6 +691,7 @@
         correctCount: 0,
         attempted: false,
         revealed: false,
+        pauseCount: 0,
         translation: null,
         translationState: 'idle'
       };
@@ -623,6 +714,7 @@
 
   function renderSentence(){
     const s = sentences[currentIndex];
+    resetPlayback();
     updateProgress();
 
     // Reset speed toggle display to whatever was last selected, keep as-is.
@@ -744,7 +836,7 @@
       zhText.textContent = s.translation;
       zhText.className = '';
     } else {
-      zhText.textContent = (s.translation || FAIL_MSG) + '（点此重试）';
+      zhText.textContent = (s.translation || FAIL_MSG);
       zhText.className = 'zh-loading';
     }
   }
@@ -789,7 +881,7 @@
   });
 
   backBtn.addEventListener('click', ()=>{
-    speechSynthesis.cancel();
+    resetPlayback();
     screenDictation.classList.add('hidden');
     screenPaste.classList.remove('hidden');
   });
@@ -835,7 +927,7 @@
 
   // ---------- summary ----------
   function showSummary(){
-    speechSynthesis.cancel();
+    resetPlayback();
     screenDictation.classList.add('hidden');
     screenSummary.classList.remove('hidden');
     let totalWords=0, totalCorrect=0;
@@ -843,9 +935,12 @@
     const pct = totalWords ? Math.round((totalCorrect/totalWords)*100) : 0;
     summaryScore.textContent = pct + '%';
     const problemCount = sentences.filter(s=>s.correctCount < s.words.length).length;
-    summarySub.textContent = problemCount
+    const pausedCount = sentences.filter(s=>(s.pauseCount||0) > 0).length;
+    let sub = problemCount
       ? `共 ${sentences.length} 句，${totalWords} 词，答对 ${totalCorrect} 词，其中 ${problemCount} 句有误`
       : `共 ${sentences.length} 句，${totalWords} 词，全部听写正确`;
+    if(pausedCount) sub += `　·　${pausedCount} 句使用了暂停播放`;
+    summarySub.textContent = sub;
     buildReport();
   }
 
@@ -853,13 +948,13 @@
     reportList.innerHTML = '';
     const problemIndexes = [];
     sentences.forEach((s,idx)=>{
-      if(s.correctCount < s.words.length) problemIndexes.push(idx);
+      if(s.correctCount < s.words.length || (s.pauseCount||0) > 0) problemIndexes.push(idx);
     });
 
     if(!problemIndexes.length){
       const empty = document.createElement('div');
       empty.className = 'report-empty';
-      empty.textContent = '太棒了，这次所有句子都听写正确！';
+      empty.textContent = '太棒了，这次所有句子都一次听写正确，也没有使用暂停！';
       reportList.appendChild(empty);
       return;
     }
@@ -883,6 +978,13 @@
         ? '已查看答案'
         : `${s.correctCount}/${s.words.length} 词正确`;
 
+      let pauseBadge = null;
+      if((s.pauseCount||0) > 0){
+        pauseBadge = document.createElement('span');
+        pauseBadge.className = 'r-badge';
+        pauseBadge.textContent = `⏸ 暂停 ${s.pauseCount} 次`;
+      }
+
       const replayBtn = document.createElement('button');
       replayBtn.className = 'r-replay';
       replayBtn.title = '再听一次';
@@ -891,6 +993,7 @@
 
       head.appendChild(num);
       head.appendChild(scoreSpan);
+      if(pauseBadge) head.appendChild(pauseBadge);
       head.appendChild(replayBtn);
 
       const sentenceDiv = document.createElement('div');
@@ -927,6 +1030,7 @@
       s.correctCount = 0;
       s.attempted = false;
       s.revealed = false;
+      s.pauseCount = 0;
     });
     currentIndex = 0;
     screenSummary.classList.add('hidden');
